@@ -87,6 +87,42 @@ input {
 table {
 	width: 100%;
 }
+.prose table {
+	border: 1px solid rgb(var(--gray));
+	border-collapse: collapse;
+	border-spacing: 0;
+	font-size: 0.9em;
+}
+.prose th,
+.prose td {
+	border: 1px solid rgb(var(--gray));
+	padding: 0.65rem 0.8rem;
+	text-align: left;
+	vertical-align: top;
+}
+.prose thead {
+	background: rgb(var(--gray-light));
+}
+.prose tbody tr:nth-child(even) {
+	background: rgba(var(--gray-light), 35%);
+}
+.compact-report p {
+	margin: 0 0 1.15rem;
+}
+.compact-report h2 {
+	margin-top: 1.8rem;
+}
+.compact-report h3 {
+	margin-top: 1.35rem;
+}
+.compact-report ul,
+.compact-report ol,
+.compact-report pre,
+.compact-report figure,
+.compact-report .table-scroll {
+	margin-top: 0.9rem;
+	margin-bottom: 1.15rem;
+}
 img {
 	max-width: 100%;
 	height: auto;
