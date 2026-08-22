@@ -1,0 +1,534 @@
+---
+title: 'Hello world in CUDA programming'
+description: 'A first CUDA programming exercise: implementing naive matrix multiplication to understand thread indexing, contiguous memory, and GPU execution.'
+pubDate: '2026-08-21'
+type: 'concept'
+tags: ['cuda', 'gpu', 'pytorch', 'matrix-multiplication']
+---
+
+This is a note for myself to review the basic concepts of GPU architecture through a programming exercise. I use CUDA and NVIDIA's software stack because they are the most widely used tools for GPU programming, but many of the underlying concepts also apply to platforms such as Apple Metal and Google TPUs.
+
+## CPU and GPU execution
+
+A CPU has a relatively small number of powerful cores designed for low-latency execution, complex control flow, and many different kinds of work. A GPU has many more, simpler execution units designed to perform the same operation across a large amount of data in parallel.
+
+GPUs are not limited to matrix multiplication, but matrix operations are a particularly good fit for this parallel design. A matrix can be viewed as a collection of rows, where each row is a one-dimensional array. Because many output elements can be calculated independently, we can divide the output matrix into equally sized tiles and assign those tiles to CUDA thread blocks.
+
+<svg viewBox="0 0 1000 390" role="img" aria-labelledby="matrix-blocks-title matrix-blocks-desc" style="display:block;width:100%;height:auto;margin:1.5rem 0">
+  <title id="matrix-blocks-title">Tiled matrix multiplication</title>
+  <desc id="matrix-blocks-desc">Matrix A, with M rows and K columns, is multiplied by matrix B, with K rows and N columns, to produce matrix C, with M rows and N columns. Each matrix is divided into smaller tiles.</desc>
+  <g transform="translate(45 75)">
+    <text x="125" y="-38" text-anchor="middle" font-family="system-ui, sans-serif" font-size="22" font-weight="700" fill="currentColor">A</text>
+    <text x="125" y="-12" text-anchor="middle" font-family="system-ui, sans-serif" font-size="17" fill="currentColor">K columns</text>
+    <text x="-16" y="125" text-anchor="middle" font-family="system-ui, sans-serif" font-size="17" fill="currentColor" transform="rotate(-90 -16 125)">M rows</text>
+    <rect x="0" y="0" width="250" height="250" rx="18" fill="none" stroke="currentColor" stroke-width="3"/>
+    <g fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="28" y="22" width="82" height="55" rx="12"/>
+      <rect x="140" y="22" width="82" height="55" rx="12"/>
+      <rect x="28" y="98" width="82" height="55" rx="12"/>
+      <rect x="140" y="98" width="82" height="55" rx="12"/>
+      <rect x="28" y="174" width="82" height="55" rx="12"/>
+      <rect x="140" y="174" width="82" height="55" rx="12"/>
+    </g>
+  </g>
+  <text x="330" y="215" text-anchor="middle" font-family="system-ui, sans-serif" font-size="40" fill="currentColor">×</text>
+  <g transform="translate(370 115)">
+    <text x="130" y="-38" text-anchor="middle" font-family="system-ui, sans-serif" font-size="22" font-weight="700" fill="currentColor">B</text>
+    <text x="130" y="-12" text-anchor="middle" font-family="system-ui, sans-serif" font-size="17" fill="currentColor">N columns</text>
+    <text x="-16" y="85" text-anchor="middle" font-family="system-ui, sans-serif" font-size="17" fill="currentColor" transform="rotate(-90 -16 85)">K rows</text>
+    <rect x="0" y="0" width="260" height="170" rx="18" fill="none" stroke="currentColor" stroke-width="3"/>
+    <g fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="20" y="22" width="60" height="50" rx="11"/>
+      <rect x="100" y="22" width="60" height="50" rx="11"/>
+      <rect x="180" y="22" width="60" height="50" rx="11"/>
+      <rect x="20" y="98" width="60" height="50" rx="11"/>
+      <rect x="100" y="98" width="60" height="50" rx="11"/>
+      <rect x="180" y="98" width="60" height="50" rx="11"/>
+    </g>
+  </g>
+  <text x="670" y="215" text-anchor="middle" font-family="system-ui, sans-serif" font-size="40" fill="currentColor">=</text>
+  <g transform="translate(710 75)">
+    <text x="125" y="-38" text-anchor="middle" font-family="system-ui, sans-serif" font-size="22" font-weight="700" fill="currentColor">C</text>
+    <text x="125" y="-12" text-anchor="middle" font-family="system-ui, sans-serif" font-size="17" fill="currentColor">N columns</text>
+    <text x="-16" y="125" text-anchor="middle" font-family="system-ui, sans-serif" font-size="17" fill="currentColor" transform="rotate(-90 -16 125)">M rows</text>
+    <rect x="0" y="0" width="250" height="250" rx="18" fill="none" stroke="currentColor" stroke-width="3"/>
+    <g fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="20" y="22" width="56" height="55" rx="11"/>
+      <rect x="97" y="22" width="56" height="55" rx="11"/>
+      <rect x="174" y="22" width="56" height="55" rx="11"/>
+      <rect x="20" y="98" width="56" height="55" rx="11"/>
+      <rect x="97" y="98" width="56" height="55" rx="11"/>
+      <rect x="174" y="98" width="56" height="55" rx="11"/>
+      <rect x="20" y="174" width="56" height="55" rx="11"/>
+      <rect x="97" y="174" width="56" height="55" rx="11"/>
+      <rect x="174" y="174" width="56" height="55" rx="11"/>
+    </g>
+  </g>
+</svg>
+
+This division is a logical partition of the work, not a physical split of the tensor into separate memory allocations. In the naive kernel below, a `BLOCK x BLOCK` tile corresponds to one CUDA thread block, and each thread computes one element inside that tile.
+
+## Code example
+
+The code below implements a basic matrix multiplication. I will cover optimization in a separate post; here, I only show the essential code so that we can focus on the concepts.
+
+```cpp
+// Naive CUDA C++ matrix-multiplication kernel: no shared memory and no tiling.
+// Every thread computes exactly one output element by reading directly from
+// global memory on every step of the K loop. This is the GPU equivalent of the
+// CPU triple loop: global-memory read -> multiply-add -> repeat K times -> one
+// global-memory write.
+//
+// The defining flaw is that neighboring threads in the same block repeatedly
+// fetch overlapping rows and columns of A and B. Nothing is staged on-chip and
+// shared between them. A tiled implementation fixes this by cooperatively
+// loading each BLOCK x BLOCK tile into shared memory once and reusing it.
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define BLOCK 16
+
+__global__ void matmul_naive_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M,
+    int K,
+    int N
+) {
+    // Map this thread to one output coordinate: C[output_row, output_col].
+    int output_row = blockIdx.y * BLOCK + threadIdx.y;
+    int output_col = blockIdx.x * BLOCK + threadIdx.x;
+
+    if (output_row >= M || output_col >= N) {
+        return;
+    }
+
+    // Keep output_row and output_col fixed while k moves across the selected
+    // row of A and down the selected column of B.
+    float acc = 0.0f;
+    for (int k = 0; k < K; k++) {
+        acc += A[output_row * K + k] * B[k * N + output_col];
+    }
+
+    // Write the completed dot product back to global memory once.
+    C[output_row * N + output_col] = acc;
+}
+
+torch::Tensor matmul_cuda_naive(torch::Tensor a, torch::Tensor b) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "inputs must be CUDA tensors");
+    TORCH_CHECK(
+        a.dtype() == torch::kFloat32 && b.dtype() == torch::kFloat32,
+        "inputs must be float32"
+    );
+    TORCH_CHECK(
+        a.is_contiguous() && b.is_contiguous(),
+        "inputs must be contiguous"
+    );
+
+    int M = a.size(0);
+    int K = a.size(1);
+    int N = b.size(1);
+
+    TORCH_CHECK(K == b.size(0), "shape mismatch");
+
+    auto c = torch::empty({M, N}, a.options());
+
+    dim3 threads(BLOCK, BLOCK);
+    dim3 blocks(
+        (N + BLOCK - 1) / BLOCK,
+        (M + BLOCK - 1) / BLOCK
+    );
+
+    matmul_naive_kernel<<<blocks, threads>>>(
+        a.data_ptr<float>(),
+        b.data_ptr<float>(),
+        c.data_ptr<float>(),
+        M,
+        K,
+        N
+    );
+
+    return c;
+}
+```
+
+## Code understanding line by line
+
+In high-level code, we commonly use notation such as `matrix[matrix_row_index][matrix_column_index]` and let the compiler or runtime translate it into a memory address. In this CUDA kernel, we work with flat pointers and calculate the offset ourselves.
+
+A contiguous two-dimensional tensor is stored as a one-dimensional sequence in row-major order. The generic flattening rule is:
+
+```text
+flat offset = matrix_row_index × matrix_column_count + matrix_column_index
+```
+
+These names describe positions in any matrix; they are not the kernel variables. In the kernel, the thread-owned coordinate is deliberately named `(output_row, output_col)`.
+
+That is why the kernel accesses the three matrices using these expressions:
+
+- `A[output_row * K + k]` for `A[output_row, k]`
+- `B[k * N + output_col]` for `B[k, output_col]`
+- `C[output_row * N + output_col]` for `C[output_row, output_col]`
+
+### The host function: `matmul_cuda_naive`
+
+The host function first validates its inputs:
+
+- **Device validation:** both input tensors must live on a CUDA device.
+- **Data-type validation:** the kernel accepts pointers to 32-bit floating-point values and performs FP32 arithmetic.
+- **Contiguity validation:** each tensor must use the dense row-major layout assumed by the index calculations in the kernel.
+- **Shape validation:** the inner dimensions must match, so an `M x K` matrix can be multiplied by a `K x N` matrix.
+
+
+Matrix multiplication repeatedly takes the dot product of a row from matrix A and a column from matrix B. If A has shape `M x K` and B has shape `K x N`, the result C has shape `M x N`.
+
+<svg viewBox="0 0 1100 380" role="img" aria-labelledby="matrix-shapes-title matrix-shapes-desc" style="display:block;width:100%;height:auto;margin:1.5rem 0">
+  <title id="matrix-shapes-title">Input shapes for matrix multiplication</title>
+  <desc id="matrix-shapes-desc">Tensor A has M rows and K columns. Tensor B has K rows and N columns.</desc>
+  <rect x="145" y="65" width="320" height="260" rx="28" fill="none" stroke="currentColor" stroke-width="3"/>
+  <rect x="575" y="65" width="430" height="260" rx="28" fill="none" stroke="currentColor" stroke-width="3"/>
+  <text x="305" y="205" text-anchor="middle" font-size="34" font-family="system-ui, sans-serif" fill="currentColor">Tensor A</text>
+  <text x="790" y="205" text-anchor="middle" font-size="34" font-family="system-ui, sans-serif" fill="currentColor">Tensor B</text>
+  <text x="305" y="42" text-anchor="middle" font-size="28" font-family="system-ui, sans-serif" font-style="italic" fill="currentColor">K</text>
+  <text x="790" y="42" text-anchor="middle" font-size="28" font-family="system-ui, sans-serif" font-style="italic" fill="currentColor">N</text>
+  <text x="90" y="205" text-anchor="middle" font-size="28" font-family="system-ui, sans-serif" font-style="italic" fill="currentColor">M</text>
+  <text x="535" y="205" text-anchor="middle" font-size="28" font-family="system-ui, sans-serif" font-style="italic" fill="currentColor">K</text>
+</svg>
+
+
+Therefore, we have the code below:
+
+```cpp
+int M = a.size(0); // Capture the row count of tensor A.
+int K = a.size(1); // Capture the column count of tensor A.
+int N = b.size(1); // Capture the column count of tensor B.
+
+// Validate that A's column count equals B's row count.
+TORCH_CHECK(K == b.size(0), "shape mismatch");
+```
+
+After confirming that the input shapes are compatible, we allocate the output tensor:
+
+```cpp
+/**
+Dot product: C = A dot B
+Given A(M, K) and B(K, N), so the output becomes C(M, N)
+**/
+auto c = torch::empty({M, N}, a.options());
+```
+
+Next, we define the CUDA launch configuration:
+
+```cpp
+dim3 threads(BLOCK, BLOCK);
+dim3 blocks(
+    (N + BLOCK - 1) / BLOCK,
+    (M + BLOCK - 1) / BLOCK
+);
+```
+
+`dim3` is CUDA's three-dimensional size type. With `BLOCK` set to `16`, `threads` describes a two-dimensional thread block containing `16 x 16`, or 256, threads. Each thread is responsible for calculating one element of `c`.
+
+`blocks` describes how many thread blocks the grid needs. CUDA's x-axis covers the `N` output columns, while its y-axis covers the `M` output rows:
+
+```text
+blocks.x = ceil(N / BLOCK)
+blocks.y = ceil(M / BLOCK)
+```
+
+Because C++ integer division normally rounds down, `(size + BLOCK - 1) / BLOCK` is used to round up. For example, 50 columns require `(50 + 16 - 1) / 16 = 4` blocks, giving enough threads to cover 64 columns. Threads that fall outside the actual matrix dimensions are discarded by the bounds check inside the kernel:
+
+```cpp
+if (output_row >= M || output_col >= N) {
+    return;
+}
+```
+
+Together, `blocks` and `threads` create a two-dimensional grid that covers every element of the `M x N` output matrix.
+
+### The CUDA kernel: `matmul_naive_kernel`
+
+This kernel contains the code executed by every CUDA thread. Because many threads run it in parallel, each thread must calculate the unique output element it owns.
+
+```cpp
+// Map this thread to one output coordinate: C[output_row, output_col].
+int output_row = blockIdx.y * BLOCK + threadIdx.y;
+int output_col = blockIdx.x * BLOCK + threadIdx.x;
+
+if (output_row >= M || output_col >= N) {
+    return;
+}
+```
+
+CUDA uses the x-axis for columns and the y-axis for rows. `blockIdx` identifies a block in the grid, while `threadIdx` identifies a thread's local position inside that block:
+
+```text
+output_row = blockIdx.y × BLOCK + threadIdx.y
+output_col = blockIdx.x × BLOCK + threadIdx.x
+```
+
+The diagram below uses CUDA's `(x, y)` ordering for `blockIdx` and `threadIdx`. For an output matrix with `M = 32`, `N = 48`, and `BLOCK = 16`, the launch creates a grid of `3 × 2` blocks. Each block covers a `16 × 16` region of the output.
+
+<svg viewBox="0 0 1000 470" role="img" aria-labelledby="thread-map-title thread-map-desc" style="display:block;width:100%;height:auto;margin:1.5rem 0">
+  <title id="thread-map-title">Mapping a CUDA block and thread to an output matrix coordinate</title>
+  <desc id="thread-map-desc">A 32 by 48 output matrix is covered by three blocks across and two blocks down. Block x zero y one is highlighted and enlarged. Inside it, local thread x one y zero maps to output row sixteen column one.</desc>
+  <defs>
+    <marker id="thread-map-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="currentColor"/></marker>
+    <pattern id="thread-map-cells" width="14" height="14" patternUnits="userSpaceOnUse"><path d="M14 0H0V14" fill="none" stroke="currentColor" stroke-opacity="0.28" stroke-width="1"/></pattern>
+  </defs>
+  <g font-family="system-ui, sans-serif" fill="currentColor">
+    <text x="300" y="30" text-anchor="middle" font-size="21" font-weight="700">Grid for C: M=32, N=48</text>
+    <text x="300" y="55" text-anchor="middle" font-size="15">Each block covers 16 × 16 output elements</text>
+    <line x1="90" y1="78" x2="525" y2="78" stroke="currentColor" stroke-width="2" marker-end="url(#thread-map-arrow)"/>
+    <text x="307" y="70" text-anchor="middle" font-size="15">columns · x-axis</text>
+    <line x1="72" y1="95" x2="72" y2="340" stroke="currentColor" stroke-width="2" marker-end="url(#thread-map-arrow)"/>
+    <text x="40" y="220" text-anchor="middle" font-size="15" transform="rotate(-90 40 220)">rows · y-axis</text>
+    <g stroke="currentColor" stroke-width="2">
+      <rect x="100" y="100" width="140" height="110" rx="10" fill="none"/>
+      <rect x="240" y="100" width="140" height="110" rx="10" fill="none"/>
+      <rect x="380" y="100" width="140" height="110" rx="10" fill="none"/>
+      <rect x="100" y="210" width="140" height="110" rx="10" fill="#f59e0b" fill-opacity="0.22" stroke="#f59e0b" stroke-width="4"/>
+      <rect x="240" y="210" width="140" height="110" rx="10" fill="none"/>
+      <rect x="380" y="210" width="140" height="110" rx="10" fill="none"/>
+    </g>
+    <g text-anchor="middle" font-size="16">
+      <text x="170" y="150">blockIdx</text><text x="170" y="174">(0, 0)</text>
+      <text x="310" y="150">blockIdx</text><text x="310" y="174">(1, 0)</text>
+      <text x="450" y="150">blockIdx</text><text x="450" y="174">(2, 0)</text>
+      <text x="170" y="260" font-weight="700">blockIdx</text><text x="170" y="284" font-weight="700">(0, 1)</text>
+      <text x="310" y="260">blockIdx</text><text x="310" y="284">(1, 1)</text>
+      <text x="450" y="260">blockIdx</text><text x="450" y="284">(2, 1)</text>
+    </g>
+    <text x="170" y="345" text-anchor="middle" font-size="14">rows 16–31 · columns 0–15</text>
+    <line x1="535" y1="265" x2="610" y2="265" stroke="currentColor" stroke-width="2" marker-end="url(#thread-map-arrow)"/>
+    <text x="735" y="30" text-anchor="middle" font-size="21" font-weight="700">Zoom: blockIdx=(0,1)</text>
+    <text x="735" y="55" text-anchor="middle" font-size="15">16 × 16 threads</text>
+    <rect x="625" y="100" width="224" height="224" fill="url(#thread-map-cells)" stroke="currentColor" stroke-width="3"/>
+    <rect x="639" y="100" width="14" height="14" fill="#f59e0b" stroke="#f59e0b" stroke-width="2"/>
+    <path d="M646 96 C670 70 785 72 840 88" fill="none" stroke="#f59e0b" stroke-width="2" marker-end="url(#thread-map-arrow)"/>
+    <text x="850" y="82" font-size="15" font-weight="700" fill="#f59e0b">threadIdx=(1,0)</text>
+    <text x="737" y="355" text-anchor="middle" font-size="16">output_row = 1 × 16 + 0 = 16</text>
+    <text x="737" y="380" text-anchor="middle" font-size="16">output_col = 0 × 16 + 1 = 1</text>
+    <rect x="595" y="397" width="284" height="48" rx="10" fill="#f59e0b" fill-opacity="0.18" stroke="#f59e0b" stroke-width="2"/>
+    <text x="737" y="427" text-anchor="middle" font-size="18" font-weight="700">This thread computes C[16,1]</text>
+  </g>
+</svg>
+
+For the highlighted block, CUDA reports:
+
+```cpp
+blockIdx.x = 0;
+blockIdx.y = 1;
+```
+
+The first thread in this block, `threadIdx = (0, 0)`, maps to the block's top-left output coordinate, `C[16, 0]`. The highlighted thread has `threadIdx = (1, 0)`, so its global coordinate is:
+
+```cpp
+output_row = blockIdx.y * BLOCK + threadIdx.y;
+           = 1 * 16 + 0;
+           = 16;
+
+output_col = blockIdx.x * BLOCK + threadIdx.x;
+           = 0 * 16 + 1;
+           = 1;
+```
+
+Therefore, this thread computes `C[16, 1]`. Every valid combination of `blockIdx` and `threadIdx` maps to a different element of `C`, so the threads do not conflict when writing the output. Multiple threads may read the same values from A or B, but those shared reads are safe.
+
+The bounds check handles threads in partially filled edge blocks. If a calculated `output_row` or `output_col` falls outside the `M × N` output, that thread exits without reading or writing memory.
+
+### Computing the dot product using flat memory
+
+After choosing its output coordinate, the thread computes the dot product between row `output_row` of A and column `output_col` of B:
+
+```cpp
+// Keep output_row and output_col fixed while k moves across A and down B.
+float acc = 0.0f;
+for (int k = 0; k < K; k++) {
+    acc += A[output_row * K + k] * B[k * N + output_col];
+}
+
+// Write the completed dot product back to global memory once.
+C[output_row * N + output_col] = acc;
+```
+
+The most important point is that `output_row` and `output_col` are fixed for the lifetime of this thread:
+
+- `output_row` identifies the target row of A that the thread must read.
+- `output_col` identifies the target column of B that the thread must read.
+- Together, `(output_row, output_col)` identifies the single output element of C that the thread must write.
+- Only `k` changes inside the loop. It walks across the selected row of A and down the selected column of B.
+
+The following example uses `output_row = 2`, `output_col = 1`, `K = 3`, and `N = 4`. The orange row from A and the blue column from B produce the green output element `C[2,1]`:
+
+<div style="overflow-x:auto;margin:1.5rem 0">
+<svg viewBox="0 0 1000 430" role="img" aria-labelledby="row-col-title row-col-desc" style="display:block;width:100%;min-width:720px;height:auto">
+  <title id="row-col-title">A selected row of A multiplied by a selected column of B</title>
+  <desc id="row-col-desc">For row two and column one, the thread reads all three values across row two of A and all three values down column one of B. Their dot product is written to row two column one of C.</desc>
+  <defs><marker id="row-col-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="currentColor"/></marker></defs>
+  <g font-family="system-ui, sans-serif" fill="currentColor">
+    <text x="500" y="28" text-anchor="middle" font-size="21" font-weight="700">output_row selects A · output_col selects B · together they select C</text>
+    <text x="145" y="68" text-anchor="middle" font-size="20" font-weight="700">A (M × K)</text>
+    <text x="145" y="91" text-anchor="middle" font-size="14">output_row = 2</text>
+    <g text-anchor="middle" font-size="13"><text x="95" y="115">k=0</text><text x="145" y="115">k=1</text><text x="195" y="115">k=2</text></g>
+    <g text-anchor="end" font-size="13"><text x="62" y="150">row 0</text><text x="62" y="200">row 1</text><text x="62" y="250" font-weight="700" fill="#d97706">row 2</text><text x="62" y="300">row 3</text></g>
+    <g stroke="currentColor" stroke-width="1.5" fill="none">
+      <rect x="70" y="120" width="50" height="50"/><rect x="120" y="120" width="50" height="50"/><rect x="170" y="120" width="50" height="50"/>
+      <rect x="70" y="170" width="50" height="50"/><rect x="120" y="170" width="50" height="50"/><rect x="170" y="170" width="50" height="50"/>
+      <rect x="70" y="220" width="50" height="50" fill="#f59e0b" fill-opacity="0.25" stroke="#d97706" stroke-width="2.5"/><rect x="120" y="220" width="50" height="50" fill="#f59e0b" fill-opacity="0.25" stroke="#d97706" stroke-width="2.5"/><rect x="170" y="220" width="50" height="50" fill="#f59e0b" fill-opacity="0.25" stroke="#d97706" stroke-width="2.5"/>
+      <rect x="70" y="270" width="50" height="50"/><rect x="120" y="270" width="50" height="50"/><rect x="170" y="270" width="50" height="50"/>
+    </g>
+    <g text-anchor="middle" font-size="14"><text x="95" y="251">A[2,0]</text><text x="145" y="251">A[2,1]</text><text x="195" y="251">A[2,2]</text></g>
+    <text x="270" y="228" text-anchor="middle" font-size="38">×</text>
+    <text x="430" y="68" text-anchor="middle" font-size="20" font-weight="700">B (K × N)</text>
+    <text x="430" y="91" text-anchor="middle" font-size="14">output_col = 1</text>
+    <g text-anchor="middle" font-size="13"><text x="355" y="115">col 0</text><text x="405" y="115" font-weight="700" fill="#2563eb">col 1</text><text x="455" y="115">col 2</text><text x="505" y="115">col 3</text></g>
+    <g text-anchor="end" font-size="13"><text x="322" y="150">k=0</text><text x="322" y="200">k=1</text><text x="322" y="250">k=2</text></g>
+    <g stroke="currentColor" stroke-width="1.5" fill="none">
+      <rect x="330" y="120" width="50" height="50"/><rect x="380" y="120" width="50" height="50" fill="#3b82f6" fill-opacity="0.22" stroke="#2563eb" stroke-width="2.5"/><rect x="430" y="120" width="50" height="50"/><rect x="480" y="120" width="50" height="50"/>
+      <rect x="330" y="170" width="50" height="50"/><rect x="380" y="170" width="50" height="50" fill="#3b82f6" fill-opacity="0.22" stroke="#2563eb" stroke-width="2.5"/><rect x="430" y="170" width="50" height="50"/><rect x="480" y="170" width="50" height="50"/>
+      <rect x="330" y="220" width="50" height="50"/><rect x="380" y="220" width="50" height="50" fill="#3b82f6" fill-opacity="0.22" stroke="#2563eb" stroke-width="2.5"/><rect x="430" y="220" width="50" height="50"/><rect x="480" y="220" width="50" height="50"/>
+    </g>
+    <g text-anchor="middle" font-size="14"><text x="405" y="151">B[0,1]</text><text x="405" y="201">B[1,1]</text><text x="405" y="251">B[2,1]</text></g>
+    <text x="575" y="228" text-anchor="middle" font-size="38">=</text>
+    <text x="735" y="68" text-anchor="middle" font-size="20" font-weight="700">C (M × N)</text>
+    <text x="735" y="91" text-anchor="middle" font-size="14">target output = C[2,1]</text>
+    <g text-anchor="middle" font-size="13"><text x="660" y="115">col 0</text><text x="710" y="115">col 1</text><text x="760" y="115">col 2</text><text x="810" y="115">col 3</text></g>
+    <g text-anchor="end" font-size="13"><text x="627" y="150">row 0</text><text x="627" y="200">row 1</text><text x="627" y="250">row 2</text><text x="627" y="300">row 3</text></g>
+    <g stroke="currentColor" stroke-width="1.5" fill="none">
+      <rect x="635" y="120" width="50" height="50"/><rect x="685" y="120" width="50" height="50"/><rect x="735" y="120" width="50" height="50"/><rect x="785" y="120" width="50" height="50"/>
+      <rect x="635" y="170" width="50" height="50"/><rect x="685" y="170" width="50" height="50"/><rect x="735" y="170" width="50" height="50"/><rect x="785" y="170" width="50" height="50"/>
+      <rect x="635" y="220" width="50" height="50"/><rect x="685" y="220" width="50" height="50" fill="#10b981" fill-opacity="0.28" stroke="#059669" stroke-width="3"/><rect x="735" y="220" width="50" height="50"/><rect x="785" y="220" width="50" height="50"/>
+      <rect x="635" y="270" width="50" height="50"/><rect x="685" y="270" width="50" height="50"/><rect x="735" y="270" width="50" height="50"/><rect x="785" y="270" width="50" height="50"/>
+    </g>
+    <text x="710" y="251" text-anchor="middle" font-size="14" font-weight="700">C[2,1]</text>
+    <path d="M145 330 C250 370 300 370 405 280" fill="none" stroke="#d97706" stroke-width="2" marker-end="url(#row-col-arrow)"/>
+    <path d="M405 280 C515 370 610 370 703 280" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#row-col-arrow)"/>
+    <text x="450" y="390" text-anchor="middle" font-size="17" font-weight="700">A[2,0..2] · B[0..2,1] → C[2,1]</text>
+    <text x="450" y="416" text-anchor="middle" font-size="14">output_row and output_col stay fixed; k moves through the paired values</text>
+  </g>
+</svg>
+</div>
+
+The tensors in this example are passed to the kernel as flat pointers. Although we think of A, B, and C as two-dimensional matrices, each contiguous tensor is stored as a one-dimensional sequence in row-major order. For any matrix, we translate a two-dimensional coordinate into a flat memory offset using generic position names:
+
+```text
+flat offset = matrix_row_index × matrix_column_count + matrix_column_index
+```
+
+The generic names above change meaning for each access. For A they become `(output_row, k)`, for B they become `(k, output_col)`, and for C they become `(output_row, output_col)`.
+
+#### Reading across one row of A
+
+A has shape `M × K`, so every row contains `K` elements. Its flat index is:
+
+```cpp
+A[output_row * K + k]
+```
+
+During this thread's loop, `output_row` stays fixed while `k` changes from `0` to `K - 1`:
+
+- `output_row * K` skips all complete rows before the selected row.
+- `+ k` selects the next column within that row.
+- Increasing `k` by one advances to the next contiguous element of A.
+
+The access pattern is therefore:
+
+```text
+A[output_row, 0], A[output_row, 1], ..., A[output_row, K - 1]
+```
+
+#### Reading down one column of B
+
+B has shape `K × N`, so every row contains `N` elements. Its flat index is:
+
+```cpp
+B[k * N + output_col]
+```
+
+Here, `output_col` stays fixed while `k` changes:
+
+- `k * N` skips `k` complete rows of B.
+- `+ output_col` selects the same target column within each row.
+- Increasing `k` by one advances the flat memory offset by `N` elements, not by `output_col`.
+
+Conceptually, this moves down one column of B:
+
+```text
+B[0, output_col], B[1, output_col], ..., B[K - 1, output_col]
+```
+
+The multiplication and addition inside the loop can therefore be written mathematically as:
+
+```text
+C[output_row, output_col] = Σ A[output_row, k] × B[k, output_col]
+                            k
+```
+
+`acc` stores this running sum. It is private to the current thread and will typically be kept in a register rather than global memory.
+
+#### Writing the result to C
+
+C has shape `M × N`, so each of its rows contains `N` elements. Once the loop completes, the thread converts its output coordinate into C's flat index:
+
+```cpp
+C[output_row * N + output_col] = acc;
+```
+
+- `output_row * N` skips all complete rows before the target row.
+- `+ output_col` selects the target column.
+- `= acc` writes the completed dot product to that one output element.
+
+The memory for C was already allocated by `torch::empty({M, N}, a.options())`; this line does not allocate more memory. It only calculates the destination offset and stores the result there.
+
+For a concrete example, suppose `output_row = 2`, `output_col = 1`, `K = 3`, and `N = 4`. This thread reads:
+
+```text
+A indices: 2×3+0 = 6, 2×3+1 = 7, 2×3+2 = 8
+B indices: 0×4+1 = 1, 1×4+1 = 5, 2×4+1 = 9
+```
+
+It accumulates:
+
+```text
+acc = A[6] × B[1] + A[7] × B[5] + A[8] × B[9]
+```
+
+Finally, it writes the result to:
+
+```text
+C index = output_row × N + output_col = 2×4+1 = 9
+```
+
+That flat offset corresponds to the two-dimensional output element `C[2, 1]`.
+
+## Takeaways and scope
+
+This naive matrix-multiplication kernel provides a concrete starting point for understanding how CUDA maps parallel work onto a GPU.
+
+### What we learned
+
+- A CPU uses a relatively small number of powerful cores, while a GPU is designed to run large numbers of similar operations in parallel.
+- Multiplying A with shape `M × K` by B with shape `K × N` produces C with shape `M × N`.
+- A CUDA launch contains a grid of thread blocks, and each block contains multiple threads.
+- In this kernel, each thread owns one output coordinate, `(output_row, output_col)`.
+- `output_row` selects one row from A, `output_col` selects one column from B, and `k` walks through the values used in their dot product.
+- Contiguous matrices are stored in row-major order, so two-dimensional coordinates must be converted into flat offsets:
+
+```text
+A offset = output_row × K + k
+B offset = k × N + output_col
+C offset = output_row × N + output_col
+```
+
+- Grid dimensions use ceiling division so the launch covers matrices whose dimensions are not exact multiples of `BLOCK`.
+- The kernel's bounds check makes the extra threads in partially filled edge blocks exit safely.
+
+### What this post does not cover
+
+This implementation is intentionally designed for clarity rather than speed. It does not yet cover:
+
+- Shared-memory tiling and reuse of values from A and B
+- Global-memory coalescing and detailed memory-access efficiency
