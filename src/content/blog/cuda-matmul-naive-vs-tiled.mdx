@@ -1,0 +1,853 @@
+---
+title: 'CUDA matmul tiling: the mental model I was missing'
+description: 'A compact mental model for CUDA matrix-multiplication tiling: output ownership, K-slice traversal, cooperative loading, shared-memory reuse, and edge handling.'
+pubDate: '2026-08-30'
+type: 'concept'
+tags: ['cuda', 'gpu', 'matrix-multiplication', 'shared-memory']
+---
+
+This note records the conceptual jump from naive CUDA matrix multiplication to shared-memory tiling. For the basic matrix math, thread indexing, and row-major address calculations, see [Hello world in CUDA programming](/blog/hello-world-cuda/).
+
+<details>
+  <summary><strong>Full tiled kernel source (Click to expand)</strong></summary>
+
+```cpp
+// Shared-memory-tiled CUDA C++ matmul kernel -- the optimized counterpart to
+// cuda_naive.cu. Shows the things Triton's tile abstraction hides -- explicit
+// threadIdx/blockIdx -> element mapping, an explicit __shared__ SRAM tile you allocate
+// and index by hand, and explicit __syncthreads() barriers between the "load into
+// SRAM" and "compute from SRAM" phases.
+//
+// Each thread owns exactly ONE output element C[row, col]. Threads in a block
+// cooperate to stage one BLOCK x BLOCK tile of A and one of B into shared memory at a
+// time, sync, consume that tile from SRAM (not HBM) for BLOCK multiply-adds, sync
+// again, then slide to the next K tile. This is the classic textbook CUDA
+// shared-memory tiled matmul -- the direct ancestor of what Triton's tl.load /
+// autotuned BLOCK_K in triton_tiled.py does implicitly. Compare against cuda_naive.cu,
+// which does the exact same math with no shared memory at all -- every thread
+// re-reads straight from HBM on every k.
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define BLOCK 16
+
+__global__ void matmul_tiled_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M, int K, int N
+) {
+    // Explicit per-thread output coordinate -- the mapping Triton's compiler does for
+    // you invisibly. Here you write it: one thread, one (row, col).
+    int row = blockIdx.y * BLOCK + threadIdx.y;
+    int col = blockIdx.x * BLOCK + threadIdx.x;
+
+    // Explicit on-chip SRAM scratch buffers, one BLOCK x BLOCK tile of A and B at a
+    // time. This is a REAL shared-memory allocation you control -- the thing Triton
+    // has no direct primitive for.
+    __shared__ float As[BLOCK][BLOCK];
+    __shared__ float Bs[BLOCK][BLOCK];
+
+    float acc = 0.0f;
+
+    // Slide a BLOCK-wide window across K. Same shape as triton_tiled.py's K-loop, but
+    // every HBM->SRAM transfer and every sync point is written out by hand.
+    for (int k0 = 0; k0 < K; k0 += BLOCK) {
+        int a_col = k0 + threadIdx.x;   // column this thread loads for A's tile
+        int b_row = k0 + threadIdx.y;   // row this thread loads for B's tile
+
+        // Phase 1: HBM -> SRAM. Each thread loads exactly one element of A and one of
+        // B into the shared tile. Out-of-bounds threads (edge tiles) write 0.
+        As[threadIdx.y][threadIdx.x] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+        Bs[threadIdx.y][threadIdx.x] = (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
+
+        // Barrier: every thread in the block must finish writing its element before
+        // ANY thread starts reading the tile -- without this, some threads would read
+        // stale/uninitialized SRAM.
+        __syncthreads();
+
+        // Phase 2: SRAM -> compute. BLOCK multiply-adds, all reading from on-chip
+        // shared memory (fast), not HBM (slow). Direct analog of triton_tiled.py's
+        // `acc = tl.dot(a, b, acc, ...)`, but written as the literal scalar loop that
+        // tl.dot compiles down to under the hood.
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK; kk++) {
+            acc += As[threadIdx.y][kk] * Bs[kk][threadIdx.x];
+        }
+
+        // Barrier: every thread must finish reading the CURRENT tile before any thread
+        // starts overwriting it with the NEXT tile's data.
+        __syncthreads();
+    }
+
+    // Phase 3: single write back to HBM, same as every other kernel in this repo.
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}
+
+
+torch::Tensor matmul_cuda_tiled(torch::Tensor a, torch::Tensor b) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "inputs must be CUDA tensors");
+    TORCH_CHECK(a.dtype() == torch::kFloat32 && b.dtype() == torch::kFloat32, "inputs must be float32");
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "inputs must be contiguous");
+
+    int M = a.size(0);
+    int K = a.size(1);
+    int N = b.size(1);
+    TORCH_CHECK(K == b.size(0), "shape mismatch");
+
+    auto c = torch::empty({M, N}, a.options());
+
+    dim3 threads(BLOCK, BLOCK);
+    dim3 blocks((N + BLOCK - 1) / BLOCK, (M + BLOCK - 1) / BLOCK);
+
+    matmul_tiled_kernel<<<blocks, threads>>>(
+        a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), M, K, N
+    );
+
+    return c;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_cuda_tiled", &matmul_cuda_tiled, "Shared-memory-tiled CUDA matmul");
+}
+```
+
+</details>
+
+The one sentence I want to remember is:
+
+> Both kernels assign one thread to one output element. Tiling does not reduce the arithmetic or make the output computation less parallel; it reorganizes input loading so threads in the same block can reuse data.
+
+My confusion came from mixing three separate layers:
+
+| Layer | Question |
+|---|---|
+| Output ownership | Which `C[row,col]` does this thread compute? |
+| K traversal | Which part of the dot product is the thread processing now? |
+| Data movement | Where do the A and B values come from? |
+
+The naive and tiled kernels differ mainly in the third layer.
+
+To avoid overloading the word “tile,” this note uses four specific terms:
+
+| Term | Meaning | Where it exists |
+|---|---|---|
+| C output region | The `BLOCK × BLOCK` part of C assigned to one CUDA block | Logical region of global C |
+| K slice | The current range `k0 .. k0+BLOCK-1` | A range of K indices, not a separate allocation |
+| A/B global source region | The rectangular part of the original A or B tensor needed for the current K slice | CUDA global-memory address space; a load may be served by cache or device DRAM |
+| `As`/`Bs` shared-memory tile | The block-private on-chip copy populated from that source region | Shared memory inside one CUDA block |
+
+The A/B global source region is not a separately allocated tile sitting in HBM. It becomes a shared-memory tile only after the block's threads load it into `As` or `Bs`.
+
+## Layer 1: output ownership is unchanged
+
+Both kernels begin with the same mapping:
+
+```cpp
+int row = blockIdx.y * BLOCK + threadIdx.y;
+int col = blockIdx.x * BLOCK + threadIdx.x;
+```
+
+Read it as:
+
+```text
+global output coordinate = block origin + local thread offset
+
+row = blockIdx.y × BLOCK + threadIdx.y
+col = blockIdx.x × BLOCK + threadIdx.x
+```
+
+`blockIdx` chooses a `BLOCK × BLOCK` region of C. `threadIdx` chooses one position inside that region. Together they identify the thread's one output element.
+
+This remains true in both implementations:
+
+```text
+naive:  one thread → one C[row,col]
+tiled:  one thread → one C[row,col]
+```
+
+Tiling does not turn many output threads into a smaller number of threads. It also does not assign one thread to each individual multiplication. In both kernels, one thread performs the complete K-axis dot product for one output.
+
+## Layer 2: K traversal is sequential inside each thread
+
+The naive kernel visits K one element at a time:
+
+```cpp
+for (int k = 0; k < K; k++) {
+    acc += A[row * K + k] * B[k * N + col];
+}
+```
+
+The tiled kernel visits the same K dimension one `BLOCK`-wide slice at a time:
+
+```cpp
+for (int k0 = 0; k0 < K; k0 += BLOCK) {
+    // stage the current K slice
+    // compute BLOCK terms from shared memory
+}
+```
+
+For one thread, `k0=0`, `k0=BLOCK`, and `k0=2×BLOCK` happen sequentially. But all output threads have their own copy of this loop and run in parallel.
+
+<figure style="margin:1.75rem 0;overflow-x:auto">
+<svg viewBox="0 0 1000 430" role="img" aria-labelledby="parallel-title parallel-desc" style="width:100%;min-width:720px;height:auto">
+  <title id="parallel-title">Parallel output threads traverse K slices sequentially</title>
+  <desc id="parallel-desc">Four output threads run in parallel. Each thread visits K slice zero, K slice one, and K slice two sequentially from left to right.</desc>
+  <defs>
+    <marker id="parallel-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="currentColor"/></marker>
+  </defs>
+  <g font-family="system-ui, sans-serif" fill="currentColor">
+    <text x="555" y="30" text-anchor="middle" font-size="23" font-weight="700">Sequential across K slices →</text>
+    <text x="68" y="220" text-anchor="middle" font-size="18" font-weight="700" transform="rotate(-90 68 220)">Parallel output threads</text>
+
+    <g font-size="17" text-anchor="middle">
+      <text x="170" y="100" font-weight="700">thread T00</text>
+      <text x="170" y="180" font-weight="700">thread T01</text>
+      <text x="170" y="260" font-weight="700">thread T10</text>
+      <text x="170" y="340" font-weight="700">thread T11</text>
+    </g>
+
+    <g stroke-width="2.5">
+      <g fill="#f59e0b" fill-opacity="0.16" stroke="#d97706">
+        <rect x="250" y="62" width="160" height="54" rx="10"/><rect x="250" y="142" width="160" height="54" rx="10"/><rect x="250" y="222" width="160" height="54" rx="10"/><rect x="250" y="302" width="160" height="54" rx="10"/>
+      </g>
+      <g fill="#3b82f6" fill-opacity="0.14" stroke="#2563eb">
+        <rect x="490" y="62" width="160" height="54" rx="10"/><rect x="490" y="142" width="160" height="54" rx="10"/><rect x="490" y="222" width="160" height="54" rx="10"/><rect x="490" y="302" width="160" height="54" rx="10"/>
+      </g>
+      <g fill="#10b981" fill-opacity="0.14" stroke="#059669">
+        <rect x="730" y="62" width="160" height="54" rx="10"/><rect x="730" y="142" width="160" height="54" rx="10"/><rect x="730" y="222" width="160" height="54" rx="10"/><rect x="730" y="302" width="160" height="54" rx="10"/>
+      </g>
+    </g>
+
+    <g font-size="16" text-anchor="middle">
+      <text x="330" y="95">K slice 0</text><text x="570" y="95">K slice 1</text><text x="810" y="95">K slice 2</text>
+      <text x="330" y="175">K slice 0</text><text x="570" y="175">K slice 1</text><text x="810" y="175">K slice 2</text>
+      <text x="330" y="255">K slice 0</text><text x="570" y="255">K slice 1</text><text x="810" y="255">K slice 2</text>
+      <text x="330" y="335">K slice 0</text><text x="570" y="335">K slice 1</text><text x="810" y="335">K slice 2</text>
+    </g>
+
+    <g stroke="currentColor" stroke-width="2" marker-end="url(#parallel-arrow)">
+      <path d="M420 89H478"/><path d="M660 89H718"/>
+      <path d="M420 169H478"/><path d="M660 169H718"/>
+      <path d="M420 249H478"/><path d="M660 249H718"/>
+      <path d="M420 329H478"/><path d="M660 329H718"/>
+    </g>
+
+    <rect x="225" y="382" width="690" height="38" rx="10" fill="#8b5cf6" fill-opacity="0.10" stroke="#7c3aed" stroke-width="2"/>
+    <text x="570" y="407" text-anchor="middle" font-size="17" font-weight="700">K-slice iteration is sequential; output ownership remains parallel.</text>
+  </g>
+</svg>
+</figure>
+
+The diagram above zooms in on the threads of one block. A real grid contains many blocks, and each block independently runs the same K-slice loop. The GPU may execute several of them concurrently, but they are not required to remain in lockstep.
+
+At the same `k0`, different output blocks can need overlapping global source regions:
+
+- C blocks in the same block row read the same region of global A.
+- C blocks in the same block column read the same region of global B.
+- Each block must load that data into its own shared memory; shared memory cannot be accessed by another block.
+
+<figure style="margin:1.75rem 0;overflow-x:auto">
+<svg viewBox="0 0 1000 520" role="img" aria-labelledby="blocks-title blocks-desc" style="width:100%;min-width:720px;height:auto">
+  <title id="blocks-title">Different output blocks may read the same global A or B source region</title>
+  <desc id="blocks-desc">At the same K slice, output blocks zero zero and one zero both read the same global A source region because they are in the same block row. Output blocks zero zero and zero one both read the same global B source region because they are in the same block column. Each output block stages its own copy in separate shared memory.</desc>
+  <defs>
+    <marker id="blocks-orange-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#d97706"/></marker>
+    <marker id="blocks-blue-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2563eb"/></marker>
+  </defs>
+  <g font-family="system-ui, sans-serif" fill="currentColor">
+    <text x="500" y="28" text-anchor="middle" font-size="23" font-weight="700">One K-slice step across several independently executing blocks</text>
+
+    <rect x="370" y="52" width="420" height="66" rx="12" fill="#f59e0b" fill-opacity="0.14" stroke="#d97706" stroke-width="2.5"/>
+    <text x="580" y="80" text-anchor="middle" font-size="17" font-weight="700">Global A source region</text>
+    <text x="580" y="103" text-anchor="middle" font-size="14">for block-row y=0 · same A rows and current K slice</text>
+
+    <rect x="40" y="195" width="260" height="90" rx="12" fill="#3b82f6" fill-opacity="0.13" stroke="#2563eb" stroke-width="2.5"/>
+    <text x="170" y="225" text-anchor="middle" font-size="17" font-weight="700">Global B source region</text>
+    <text x="170" y="249" text-anchor="middle" font-size="14">for block-column x=0</text>
+    <text x="170" y="271" text-anchor="middle" font-size="14">same B columns and current K slice</text>
+
+    <path d="M500 122C465 142 450 153 440 177" fill="none" stroke="#d97706" stroke-width="3" marker-end="url(#blocks-orange-arrow)"/>
+    <path d="M660 122C730 143 774 154 804 177" fill="none" stroke="#d97706" stroke-width="3" marker-end="url(#blocks-orange-arrow)"/>
+    <path d="M305 230C340 218 365 214 392 214" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#blocks-blue-arrow)"/>
+    <path d="M300 257C340 310 365 342 392 361" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#blocks-blue-arrow)"/>
+
+    <rect x="405" y="180" width="250" height="125" rx="15" fill="#8b5cf6" fill-opacity="0.06" stroke="#7c3aed" stroke-width="2.5"/>
+    <text x="530" y="208" text-anchor="middle" font-size="18" font-weight="700">C block (x=0, y=0)</text>
+    <rect x="420" y="225" width="220" height="60" rx="9" fill="#10b981" fill-opacity="0.13" stroke="#059669" stroke-width="2"/>
+    <text x="530" y="249" text-anchor="middle" font-size="15" font-weight="700">private shared memory</text>
+    <text x="530" y="270" text-anchor="middle" font-size="13">its own As and Bs</text>
+
+    <rect x="705" y="180" width="250" height="125" rx="15" fill="#8b5cf6" fill-opacity="0.06" stroke="#7c3aed" stroke-width="2.5"/>
+    <text x="830" y="208" text-anchor="middle" font-size="18" font-weight="700">C block (x=1, y=0)</text>
+    <rect x="720" y="225" width="220" height="60" rx="9" fill="#10b981" fill-opacity="0.13" stroke="#059669" stroke-width="2"/>
+    <text x="830" y="246" text-anchor="middle" font-size="15" font-weight="700">private shared memory</text>
+    <text x="830" y="266" text-anchor="middle" font-size="12.5">stages its own copy</text>
+    <text x="830" y="281" text-anchor="middle" font-size="12.5">from global A</text>
+
+    <rect x="405" y="330" width="250" height="125" rx="15" fill="#8b5cf6" fill-opacity="0.06" stroke="#7c3aed" stroke-width="2.5"/>
+    <text x="530" y="358" text-anchor="middle" font-size="18" font-weight="700">C block (x=0, y=1)</text>
+    <rect x="420" y="375" width="220" height="60" rx="9" fill="#10b981" fill-opacity="0.13" stroke="#059669" stroke-width="2"/>
+    <text x="530" y="396" text-anchor="middle" font-size="15" font-weight="700">private shared memory</text>
+    <text x="530" y="416" text-anchor="middle" font-size="12.5">stages its own copy</text>
+    <text x="530" y="431" text-anchor="middle" font-size="12.5">from global B</text>
+
+    <path d="M670 242H690" stroke="currentColor" stroke-opacity="0.35" stroke-width="2" stroke-dasharray="5 5"/>
+    <text x="680" y="326" text-anchor="middle" font-size="14">no shared-memory connection between blocks</text>
+
+    <rect x="190" y="475" width="620" height="36" rx="9" fill="#f59e0b" fill-opacity="0.10" stroke="#d97706" stroke-width="2"/>
+    <text x="500" y="499" text-anchor="middle" font-size="16" font-weight="700">Blocks may repeat global loads even while each block reuses data internally.</text>
+  </g>
+</svg>
+</figure>
+
+The repeated loads may be satisfied by hardware caches rather than physical device DRAM. The logical CUDA guarantee is only that shared-memory reuse is local to one block.
+
+This distinction is central:
+
+```text
+sequential: one thread moves across the K slices
+parallel:   many threads and potentially many blocks do this independently
+```
+
+## Layer 3: tiling changes data movement
+
+The naive kernel reads its inputs using global addresses during every K iteration:
+
+```cpp
+acc += A[row * K + k] * B[k * N + col];
+```
+
+Neighboring threads need overlapping data. Threads in the same output row reuse A values; threads in the same output column reuse B values. The naive source expresses those needs as separate global-memory loads.
+
+This is the point where naive and tiled genuinely diverge, and the divergence is best understood as *how many coordinate systems the kernel needs.*
+
+**Naive has one coordinate system.** `row` and `col` are fixed once, and `k` walks straight through global memory:
+
+```cpp
+int row = blockIdx.y * BLOCK + threadIdx.y;   // fixed for this thread, forever
+int col = blockIdx.x * BLOCK + threadIdx.x;   // fixed for this thread, forever
+
+for (int k = 0; k < K; k++) {
+    acc += A[row * K + k] * B[k * N + col];   // reach straight into HBM, every k
+}
+```
+
+One thread, one output element, one global `(row, col)`, and `k` indexes straight into HBM every time. There is nothing else to track.
+
+**Tiled has two coordinate systems, nested.** The first is the same global `(row, col)` as naive — it still says which output element this thread owns, and nothing about it changes:
+
+```cpp
+int row = blockIdx.y * BLOCK + threadIdx.y;
+int col = blockIdx.x * BLOCK + threadIdx.x;
+```
+
+The second is new: a *local* coordinate that means "my position inside the current `BLOCK × BLOCK` shared-memory tile," reusing `threadIdx.y` / `threadIdx.x` but with a different meaning than in the global calculation above. It first appears when a thread copies one value from global memory into its shared-memory slot:
+
+```cpp
+__shared__ float As[BLOCK][BLOCK];
+__shared__ float Bs[BLOCK][BLOCK];
+
+As[threadIdx.y][threadIdx.x] = ...;   // local coord: position inside this tile
+Bs[threadIdx.y][threadIdx.x] = ...;
+```
+
+That's the only new idea in this layer: **the same `threadIdx.y`/`threadIdx.x` pair now also names a slot inside the tile, on top of what it already meant for `row`/`col`.** What eventually happens with that slot — sync, then a dot-product loop over it — is a separate step covered in the worked example below; this layer is only about *where the two coordinate systems come from*.
+
+|  | Naive | Tiled |
+|---|---|---|
+| Who decides the output element | `(row, col)` from `blockIdx`/`threadIdx` | Same — unchanged |
+| Where the K-loop reads from | Global memory (HBM), every iteration | Shared-memory tile, refilled from HBM once per `BLOCK` steps |
+| Number of coordinate systems | 1 (global) | 2 (global for output, local for position-inside-tile) |
+| Redundant global-memory traffic | Yes — overlapping rows/columns are re-fetched independently by each thread | No — one cooperative load per tile, reused via shared memory |
+
+The naive kernel has no local frame because it never stages anything on-chip; there is nothing to have a local coordinate *into*. Tiling only needs one because it interposes a staging area between HBM and the arithmetic.
+
+<figure style="margin:1.75rem 0;overflow-x:auto">
+<svg viewBox="0 0 1000 460" role="img" aria-labelledby="two-frames-title two-frames-desc" style="width:100%;min-width:720px;height:auto">
+  <title id="two-frames-title">One thread, two coordinate systems</title>
+  <desc id="two-frames-desc">The same thread has a global coordinate row comma col that fixes its position in the whole output matrix C, and a separate local coordinate ty comma tx that fixes its position inside the current block sized shared memory tile. The global coordinate never changes. The local coordinate is reused every K slice.</desc>
+  <defs>
+    <marker id="two-frames-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="currentColor"/></marker>
+  </defs>
+  <g font-family="system-ui, sans-serif" fill="currentColor">
+    <text x="500" y="30" text-anchor="middle" font-size="23" font-weight="700">Same thread, two coordinate frames</text>
+
+    <rect x="40" y="60" width="380" height="330" rx="16" fill="#3b82f6" fill-opacity="0.06" stroke="#2563eb" stroke-width="2.5"/>
+    <text x="230" y="90" text-anchor="middle" font-size="18" font-weight="700" fill="#2563eb">Global frame</text>
+    <text x="230" y="112" text-anchor="middle" font-size="14">position in the whole output matrix C</text>
+
+    <rect x="90" y="135" width="280" height="210" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5" stroke-width="1.5"/>
+    <g stroke="currentColor" stroke-opacity="0.3" stroke-width="1">
+      <path d="M160 135V345M230 135V345M300 135V345"/>
+      <path d="M90 187H370M90 240H370M90 292H370"/>
+    </g>
+    <rect x="230" y="187" width="70" height="53" fill="#2563eb" fill-opacity="0.30" stroke="#2563eb" stroke-width="3"/>
+    <text x="265" y="217" text-anchor="middle" font-size="15" font-weight="700" fill="#2563eb">row,col</text>
+
+    <text x="230" y="372" text-anchor="middle" font-size="16" font-weight="700" fill="#2563eb">fixed for the whole kernel</text>
+
+    <rect x="580" y="60" width="380" height="330" rx="16" fill="#f59e0b" fill-opacity="0.06" stroke="#d97706" stroke-width="2.5"/>
+    <text x="770" y="90" text-anchor="middle" font-size="18" font-weight="700" fill="#d97706">Local frame</text>
+    <text x="770" y="112" text-anchor="middle" font-size="14">position inside the current As/Bs shared tile</text>
+
+    <rect x="650" y="150" width="240" height="180" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5" stroke-width="1.5"/>
+    <g stroke="currentColor" stroke-opacity="0.3" stroke-width="1">
+      <path d="M710 150V330M770 150V330M830 150V330"/>
+      <path d="M650 195H890M650 240H890M650 285H890"/>
+    </g>
+    <rect x="710" y="150" width="60" height="45" fill="#d97706" fill-opacity="0.30" stroke="#d97706" stroke-width="3"/>
+    <text x="740" y="177" text-anchor="middle" font-size="14" font-weight="700" fill="#d97706">ty,tx</text>
+
+    <text x="770" y="360" text-anchor="middle" font-size="16" font-weight="700" fill="#d97706">reused every K slice</text>
+
+    <path d="M420 220C480 220 520 220 578 220" fill="none" stroke="currentColor" stroke-width="2.5" marker-end="url(#two-frames-arrow)"/>
+    <path d="M578 240C520 240 480 240 420 240" fill="none" stroke="currentColor" stroke-width="2.5" marker-end="url(#two-frames-arrow)"/>
+    <text x="500" y="205" text-anchor="middle" font-size="14" font-weight="700">same</text>
+    <text x="500" y="260" text-anchor="middle" font-size="14" font-weight="700">thread</text>
+
+    <rect x="150" y="410" width="700" height="38" rx="10" fill="#8b5cf6" fill-opacity="0.10" stroke="#7c3aed" stroke-width="2"/>
+    <text x="500" y="435" text-anchor="middle" font-size="16" font-weight="700">Global says which output it owns; local says where it sits in the tile right now.</text>
+  </g>
+</svg>
+</figure>
+
+Put together, the tiled kernel splits each K-slice iteration into four steps, always in this order:
+
+```text
+1. load    — every thread copies one A value and one B value into As/Bs (global -> local)
+2. sync    — wait until the whole tile is written before anyone reads it
+3. compute — every thread walks the local frame to accumulate this slice's contribution
+4. sync    — wait until everyone is done reading before the tile is overwritten
+```
+
+The worked example below walks these four steps in this exact order. The amount of matrix-multiplication arithmetic is essentially unchanged; the optimization targets global-memory traffic by making reuse explicit inside the block.
+
+### Tile movement direction
+
+Both `As` and `Bs` are refilled every outer iteration, sliding forward along the same `k0`. Because K sits on a different axis in each matrix, the two tiles slide in different directions:
+
+<figure style="margin:1.75rem 0;overflow-x:auto">
+<svg viewBox="0 0 1000 460" role="img" aria-labelledby="tile-move-title tile-move-desc" style="width:100%;min-width:720px;height:auto">
+  <title id="tile-move-title">A's tile slides right while B's tile slides down as k0 advances</title>
+  <desc id="tile-move-desc">Matrix A is M by K, so its current K slice is a vertical strip of columns that moves rightward as k0 increases, while the row stays fixed. Matrix B is K by N, so its current K slice is a horizontal strip of rows that moves downward as k0 increases, while the column stays fixed. Both moves are driven by the same k0 and stay in lockstep.</desc>
+  <defs>
+    <marker id="tile-move-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="currentColor"/></marker>
+  </defs>
+  <g font-family="system-ui, sans-serif" fill="currentColor">
+    <text x="500" y="30" text-anchor="middle" font-size="23" font-weight="700">Same k0, two directions of travel</text>
+
+    <text x="220" y="70" text-anchor="middle" font-size="18" font-weight="700" fill="#d97706">A (M × K) — row fixed</text>
+    <rect x="70" y="90" width="300" height="130" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5" stroke-width="1.5"/>
+    <g stroke="currentColor" stroke-opacity="0.3" stroke-width="1">
+      <path d="M145 90V220M220 90V220M295 90V220"/>
+      <path d="M70 155H370"/>
+    </g>
+    <rect x="145" y="90" width="75" height="65" fill="#f59e0b" fill-opacity="0.30" stroke="#d97706" stroke-width="3"/>
+    <rect x="220" y="90" width="75" height="65" fill="#f59e0b" fill-opacity="0.12" stroke="#d97706" stroke-width="2" stroke-dasharray="5 4"/>
+    <path d="M300 122H395" stroke="#d97706" stroke-width="3" marker-end="url(#tile-move-arrow)"/>
+    <text x="220" y="248" text-anchor="middle" font-size="15" font-weight="700" fill="#d97706">k0 advances → tile slides RIGHT</text>
+    <text x="220" y="270" text-anchor="middle" font-size="14">(K is A's column axis)</text>
+
+    <text x="770" y="70" text-anchor="middle" font-size="18" font-weight="700" fill="#2563eb">B (K × N) — column fixed</text>
+    <rect x="670" y="90" width="140" height="300" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5" stroke-width="1.5"/>
+    <g stroke="currentColor" stroke-opacity="0.3" stroke-width="1">
+      <path d="M740 90V390"/>
+      <path d="M670 165H810M670 240H810M670 315H810"/>
+    </g>
+    <rect x="670" y="90" width="140" height="75" fill="#3b82f6" fill-opacity="0.30" stroke="#2563eb" stroke-width="3"/>
+    <rect x="670" y="165" width="140" height="75" fill="#3b82f6" fill-opacity="0.12" stroke="#2563eb" stroke-width="2" stroke-dasharray="5 4"/>
+    <path d="M740 168V245" stroke="#2563eb" stroke-width="3" marker-end="url(#tile-move-arrow)"/>
+    <text x="900" y="130" text-anchor="middle" font-size="15" font-weight="700" fill="#2563eb">k0 advances</text>
+    <text x="900" y="150" text-anchor="middle" font-size="15" font-weight="700" fill="#2563eb">→ tile slides DOWN</text>
+    <text x="900" y="175" text-anchor="middle" font-size="14">(K is B's row axis)</text>
+
+    <rect x="150" y="415" width="700" height="38" rx="10" fill="#8b5cf6" fill-opacity="0.10" stroke="#7c3aed" stroke-width="2"/>
+    <text x="500" y="440" text-anchor="middle" font-size="16" font-weight="700">Same k0 drives both — they always describe the same K slice.</text>
+  </g>
+</svg>
+</figure>
+
+- **A's tile moves horizontally** — K is A's *column* axis, so advancing `k0` slides it rightward.
+- **B's tile moves vertically** — K is B's *row* axis, so advancing `k0` slides it downward.
+- Both are driven by the same `k0`, so they stay in lockstep: the A columns `k0..k0+BLOCK` and the B rows `k0..k0+BLOCK` always describe the same slice of the shared K dimension.
+
+## One small worked example
+
+Use `BLOCK=2` so every coordinate is visible. Consider:
+
+```text
+blockIdx  = (x=1, y=0)
+threadIdx = (x=1, y=0)
+k0        = 2
+```
+
+Before doing the arithmetic, locate the block and thread visually:
+
+<figure style="margin:1.75rem 0;overflow-x:auto">
+<svg viewBox="0 0 920 560" role="img" aria-labelledby="output-map-title output-map-desc" style="width:100%;min-width:680px;height:auto">
+  <title id="output-map-title">A block and thread mapped onto a four by four output matrix</title>
+  <desc id="output-map-desc">For block size two, block index x one y zero selects the top-right two-by-two output region of C. Thread index x one y zero selects the top-right cell inside that region, which is global output row zero column three. The formula is row equals blockIdx dot y times BLOCK plus threadIdx dot y, and col equals blockIdx dot x times BLOCK plus threadIdx dot x.</desc>
+  <defs>
+    <marker id="output-map-blue-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2563eb"/></marker>
+    <marker id="output-map-orange-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#d97706"/></marker>
+  </defs>
+  <g font-family="system-ui, sans-serif" fill="currentColor">
+    <text x="620" y="30" text-anchor="middle" font-size="23" font-weight="700">Output C (4 × 4)</text>
+
+    <rect x="20" y="60" width="340" height="112" rx="13" fill="#3b82f6" fill-opacity="0.12" stroke="#2563eb" stroke-width="2.5"/>
+    <text x="190" y="88" text-anchor="middle" font-size="17" font-weight="700">blockIdx = (x=1, y=0)</text>
+    <text x="190" y="114" text-anchor="middle" font-size="14">col = blockIdx.x × BLOCK = 1×2 = 2</text>
+    <text x="190" y="134" text-anchor="middle" font-size="14">row = blockIdx.y × BLOCK = 0×2 = 0</text>
+    <text x="190" y="158" text-anchor="middle" font-size="14" font-style="italic">→ block origin C[0,2]</text>
+
+    <rect x="20" y="248" width="340" height="112" rx="13" fill="#f59e0b" fill-opacity="0.13" stroke="#d97706" stroke-width="2.5"/>
+    <text x="190" y="276" text-anchor="middle" font-size="17" font-weight="700">threadIdx = (x=1, y=0)</text>
+    <text x="190" y="302" text-anchor="middle" font-size="14">local col = threadIdx.x = 1</text>
+    <text x="190" y="322" text-anchor="middle" font-size="14">local row = threadIdx.y = 0</text>
+    <text x="190" y="346" text-anchor="middle" font-size="14" font-style="italic">→ offset (row 0, col 1) inside the block</text>
+
+    <path d="M365 130C445 130 520 138 612 150" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#output-map-blue-arrow)"/>
+    <path d="M365 300C470 275 590 195 682 130" fill="none" stroke="#d97706" stroke-width="3" marker-end="url(#output-map-orange-arrow)"/>
+
+    <g font-size="15" text-anchor="middle">
+      <text x="515" y="64">col 0</text><text x="585" y="64">col 1</text><text x="655" y="64">col 2</text><text x="725" y="64">col 3</text>
+      <text x="455" y="116">row 0</text><text x="455" y="186">row 1</text><text x="455" y="256">row 2</text><text x="455" y="326">row 3</text>
+    </g>
+
+    <rect x="480" y="80" width="280" height="280" rx="10" fill="none" stroke="currentColor" stroke-width="3"/>
+    <g stroke="currentColor" stroke-opacity="0.45" stroke-width="1.5">
+      <path d="M550 80V360M620 80V360M690 80V360"/>
+      <path d="M480 150H760M480 220H760M480 290H760"/>
+    </g>
+
+    <rect x="620" y="80" width="140" height="140" fill="#3b82f6" fill-opacity="0.15" stroke="#2563eb" stroke-width="4"/>
+
+    <rect x="690" y="80" width="70" height="70" fill="#10b981" fill-opacity="0.35" stroke="#059669" stroke-width="4"/>
+    <text x="725" y="121" text-anchor="middle" font-size="16" font-weight="700">C[0,3]</text>
+
+    <circle cx="620" cy="80" r="7" fill="#2563eb"/>
+    <text x="690" y="386" text-anchor="middle" font-size="15" fill="#2563eb" font-weight="700">block's 2×2 C region</text>
+    <text x="690" y="406" text-anchor="middle" font-size="14" fill="#2563eb">(block origin is C[0,2])</text>
+
+    <rect x="90" y="410" width="740" height="130" rx="13" fill="#10b981" fill-opacity="0.11" stroke="#059669" stroke-width="2.5"/>
+    <text x="460" y="436" text-anchor="middle" font-size="15" font-weight="700">row = blockIdx.y×BLOCK + threadIdx.y = 0×2 + 0 = 0</text>
+    <text x="460" y="460" text-anchor="middle" font-size="15" font-weight="700">col = blockIdx.x×BLOCK + threadIdx.x = 1×2 + 1 = 3</text>
+    <text x="460" y="490" text-anchor="middle" font-size="14">block origin (row 0, col 2) + local offset (row 0, col 1)</text>
+    <text x="460" y="518" text-anchor="middle" font-size="19" font-weight="700">= global output C[0,3]</text>
+  </g>
+</svg>
+<figcaption style="font-size:.9em;text-align:center;margin-top:.65rem">`blockIdx` selects the blue output region of C. `threadIdx` selects the green cell inside that region.</figcaption>
+</figure>
+
+The picture gives the answer first. The index calculation confirms it:
+
+```text
+row = 0×2 + 0 = 0
+col = 1×2 + 1 = 3
+
+this thread owns C[0,3]
+```
+
+That ownership is fixed for the complete kernel.
+
+### Step 1 — load: copy one global value into one local slot
+
+For readability, define:
+
+```cpp
+int ty = threadIdx.y;
+int tx = threadIdx.x;
+```
+
+The loading code is:
+
+```cpp
+int a_col = k0 + tx;
+int b_row = k0 + ty;
+
+As[ty][tx] = A[row * K + a_col];
+Bs[ty][tx] = B[b_row * N + col];
+```
+
+The simplest way to read it is:
+
+```text
+A source = A[my fixed output row, k0 + my local x]
+B source = B[k0 + my local y, my fixed output column]
+
+A destination = As[my local y][my local x]
+B destination = Bs[my local y][my local x]
+```
+
+For this thread:
+
+```text
+A source: A[row, k0+tx] = A[0, 2+1] = A[0,3]
+B source: B[k0+ty, col] = B[2+0, 3] = B[2,3]
+
+A[0,3] → As[0][1]
+B[2,3] → Bs[0][1]
+```
+
+<figure style="margin:1.75rem 0;overflow-x:auto">
+<svg viewBox="0 0 920 610" role="img" aria-labelledby="mapping-title mapping-desc" style="width:100%;min-width:680px;height:auto">
+  <title id="mapping-title">One thread loads one A value and one B value into matching shared-memory slots</title>
+  <desc id="mapping-desc">With block size two, k0 equal two, and this thread at local row zero column one, the A source formula gives A row zero column three, and the B source formula gives B row two column three. Both values are written into the same local slot row zero column one, one inside the As tile and one inside the Bs tile.</desc>
+  <defs>
+    <marker id="mapping-blue-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2563eb"/></marker>
+    <marker id="mapping-orange-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#d97706"/></marker>
+  </defs>
+  <g font-family="system-ui, sans-serif" fill="currentColor">
+    <text x="620" y="30" text-anchor="middle" font-size="23" font-weight="700">As / Bs shared tile (2 × 2)</text>
+
+    <rect x="20" y="60" width="340" height="118" rx="13" fill="#f59e0b" fill-opacity="0.13" stroke="#d97706" stroke-width="2.5"/>
+    <text x="190" y="88" text-anchor="middle" font-size="17" font-weight="700">A source (k0=2)</text>
+    <text x="190" y="114" text-anchor="middle" font-size="14">a_col = k0 + tx = 2+1 = 3</text>
+    <text x="190" y="134" text-anchor="middle" font-size="14">A[row, a_col] = A[0,3]</text>
+    <text x="190" y="158" text-anchor="middle" font-size="14" font-style="italic">→ As[ty][tx] = As[0][1]</text>
+
+    <rect x="20" y="254" width="340" height="118" rx="13" fill="#3b82f6" fill-opacity="0.12" stroke="#2563eb" stroke-width="2.5"/>
+    <text x="190" y="282" text-anchor="middle" font-size="17" font-weight="700">B source (k0=2)</text>
+    <text x="190" y="308" text-anchor="middle" font-size="14">b_row = k0 + ty = 2+0 = 2</text>
+    <text x="190" y="328" text-anchor="middle" font-size="14">B[b_row, col] = B[2,3]</text>
+    <text x="190" y="352" text-anchor="middle" font-size="14" font-style="italic">→ Bs[ty][tx] = Bs[0][1]</text>
+
+    <path d="M365 138C455 138 530 145 618 155" fill="none" stroke="#d97706" stroke-width="3" marker-end="url(#mapping-orange-arrow)"/>
+    <path d="M365 320C470 320 545 315 618 305" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#mapping-blue-arrow)"/>
+
+    <text x="900" y="95" text-anchor="middle" font-size="17" font-weight="700" fill="#d97706">As</text>
+    <text x="900" y="285" text-anchor="middle" font-size="17" font-weight="700" fill="#2563eb">Bs</text>
+
+    <rect x="480" y="80" width="280" height="140" rx="10" fill="none" stroke="#d97706" stroke-width="3"/>
+    <g stroke="currentColor" stroke-opacity="0.45" stroke-width="1.5">
+      <path d="M620 80V220"/>
+      <path d="M480 150H760"/>
+    </g>
+    <text x="550" y="70" text-anchor="middle" font-size="14">tx 0</text>
+    <text x="690" y="70" text-anchor="middle" font-size="14">tx 1</text>
+    <text x="465" y="120" text-anchor="middle" font-size="14">ty 0</text>
+    <text x="465" y="190" text-anchor="middle" font-size="14">ty 1</text>
+    <rect x="620" y="80" width="140" height="70" fill="#f59e0b" fill-opacity="0.30" stroke="#d97706" stroke-width="4"/>
+    <text x="690" y="121" text-anchor="middle" font-size="15" font-weight="700">As[0][1]=A[0,3]</text>
+
+    <rect x="480" y="270" width="280" height="140" rx="10" fill="none" stroke="#2563eb" stroke-width="3"/>
+    <g stroke="currentColor" stroke-opacity="0.45" stroke-width="1.5">
+      <path d="M620 270V410"/>
+      <path d="M480 340H760"/>
+    </g>
+    <text x="550" y="260" text-anchor="middle" font-size="14">tx 0</text>
+    <text x="690" y="260" text-anchor="middle" font-size="14">tx 1</text>
+    <text x="465" y="310" text-anchor="middle" font-size="14">ty 0</text>
+    <text x="465" y="380" text-anchor="middle" font-size="14">ty 1</text>
+    <rect x="620" y="270" width="140" height="70" fill="#3b82f6" fill-opacity="0.30" stroke="#2563eb" stroke-width="4"/>
+    <text x="690" y="311" text-anchor="middle" font-size="15" font-weight="700">Bs[0][1]=B[2,3]</text>
+
+    <text x="620" y="450" text-anchor="middle" font-size="15" font-weight="700">same slot [ty][tx] = [0][1] in both tiles</text>
+
+    <rect x="60" y="480" width="800" height="112" rx="13" fill="#10b981" fill-opacity="0.11" stroke="#059669" stroke-width="2.5"/>
+    <text x="460" y="507" text-anchor="middle" font-size="15" font-weight="700">As[ty][tx] = A[row, k0+tx] = A[0, 2+1] = A[0,3]</text>
+    <text x="460" y="531" text-anchor="middle" font-size="15" font-weight="700">Bs[ty][tx] = B[k0+ty, col] = B[2+0, 3] = B[2,3]</text>
+    <text x="460" y="558" text-anchor="middle" font-size="14">Global source coordinates differ (A[0,3] vs B[2,3]);</text>
+    <text x="460" y="578" text-anchor="middle" font-size="14" font-weight="700">the local destination slot is the same: [ty][tx] = [0][1].</text>
+  </g>
+</svg>
+</figure>
+
+The local coordinate `(ty,tx)` does not replace the global coordinates. It connects the current thread to one position inside each block-owned shared-memory tile.
+
+This thread only ever writes **one** `As` entry and **one** `Bs` entry. With `BLOCK=2`, the whole block has four threads, and together they fill all four entries of each tile — no thread fills more than its own slot:
+
+```text
+T00 fills [0][0]    T01 fills [0][1]
+T10 fills [1][0]    T11 fills [1][1]
+```
+
+### Step 2 — sync: wait for the whole tile
+
+```cpp
+__syncthreads();
+```
+
+At this point some threads may have already written their slot while others haven't. The barrier means: **no thread may move past this line until every thread in the block has reached it.** Only after the barrier is it safe to assume `As` and `Bs` are completely filled — this thread is about to read slots it did *not* write itself (`As[0][0]` and `Bs[1][1]`, from the step below), so it must wait for whichever neighbor writes them.
+
+### Step 3 — compute: consume the whole tile, not just your own slot
+
+Now the thread producing `C[0,3]` runs the dot-product loop over the local frame:
+
+```cpp
+for (int kk = 0; kk < BLOCK; kk++) {
+    acc += As[ty][kk] * Bs[kk][tx];
+}
+```
+
+For `ty=0`, `tx=1`, `BLOCK=2`, that expands to:
+
+```text
+As[0][0] × Bs[0][1]
++ As[0][1] × Bs[1][1]
+```
+
+This thread loaded only `As[0][1]` and `Bs[0][1]` in step 1 — but step 3 reads `As[0][0]` and `Bs[1][1]` too, which its neighbors loaded. That cross-reading is exactly the cooperation and reuse the naive kernel doesn't have: every thread loads once, but consumes `BLOCK` values that mostly came from someone else.
+
+### Step 4 — sync: wait before the tile is overwritten
+
+```cpp
+__syncthreads();
+```
+
+The loop advances to the next `k0` right after this, and step 1 of the next iteration overwrites `As`/`Bs`. This second barrier means: **no thread may start overwriting the tile until every thread has finished reading it in step 3.** Without it, a fast thread could start step 1 of the next slice while a slow neighbor is still mid-loop in step 3, corrupting the values it's reading.
+
+### The four steps together
+
+```cpp
+As[ty][tx] = ...;                 // 1. load
+Bs[ty][tx] = ...;
+
+__syncthreads();                  // 2. sync — tile is now complete
+
+for (int kk = 0; kk < BLOCK; kk++) {
+    acc += As[ty][kk] * Bs[kk][tx];   // 3. compute — read the whole tile
+}
+
+__syncthreads();                  // 4. sync — safe to overwrite next iteration
+```
+
+Every K-slice iteration repeats these four steps in this exact order. There is no valid order where compute happens before load, or where the second sync is skipped — the two barriers are asymmetric guards on the two directions of the same hazard: reading a tile too early, and overwriting one too soon.
+
+## What reuse tiling provides
+
+Shared memory belongs to one CUDA block:
+
+```text
+within one block
+    → threads cooperatively load global A/B source regions into As and Bs
+    → threads reuse those shared-memory values
+    → duplicate global-memory loads are greatly reduced
+
+across different blocks
+    → each block has independent shared memory
+    → the same A or B data may be loaded again
+```
+
+Hardware caches may serve some repeated loads between blocks, so a repeated global-memory instruction does not necessarily reach physical device DRAM. Logically, however, shared-memory reuse stops at the block boundary.
+
+The sentence to remember is:
+
+> Tiling reduces redundant input loads within a block, not necessarily across blocks.
+
+## Why tiled loads need extra edge checks
+
+The naive kernel checks its output coordinate once and is done:
+
+```cpp
+if (row >= M || col >= N) return;
+for (int k = 0; k < K; k++) {
+    acc += A[row * K + k] * B[k * N + col];   // k is always < K here — no further check needed
+}
+```
+
+`k` never leaves `[0, K)`, so every address the loop touches is valid by construction. There's nothing to check inside the loop.
+
+Tiling breaks that guarantee. It advances K in whole `BLOCK` chunks, and if `K` isn't a multiple of `BLOCK`, the last chunk doesn't end exactly at the matrix edge — it overshoots:
+
+<figure style="margin:1.75rem 0;overflow-x:auto">
+<svg viewBox="0 0 1000 340" role="img" aria-labelledby="overhang-title overhang-desc" style="width:100%;min-width:720px;height:auto">
+  <title id="overhang-title">The final K tile overhangs the matrix when K is not a multiple of BLOCK</title>
+  <desc id="overhang-desc">A matrix with K equal to eighteen and BLOCK equal to sixteen has two K tiles. The first tile exactly covers columns zero to fifteen. The second tile starts at column sixteen and would nominally cover sixteen columns, but the matrix only has two columns left, so most of that tile reaches past the real edge into invalid memory unless it is checked and zero padded.</desc>
+  <defs>
+    <marker id="overhang-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="currentColor"/></marker>
+  </defs>
+  <g font-family="system-ui, sans-serif" fill="currentColor">
+    <text x="500" y="30" text-anchor="middle" font-size="22" font-weight="700">K = 18, BLOCK = 16 — the last tile overshoots</text>
+
+    <text x="500" y="65" text-anchor="middle" font-size="15">one row of A, columns 0..17 (K axis)</text>
+    <rect x="100" y="85" width="800" height="70" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5" stroke-width="1.5"/>
+
+    <rect x="100" y="85" width="711" height="70" fill="#10b981" fill-opacity="0.14" stroke="#059669" stroke-width="2.5"/>
+    <text x="455" y="115" text-anchor="middle" font-size="15" font-weight="700" fill="#059669">tile 0: k0=0, columns 0..15</text>
+    <text x="455" y="135" text-anchor="middle" font-size="13" fill="#059669">fully inside the matrix — no check needed</text>
+
+    <rect x="811" y="85" width="11" height="70" fill="#3b82f6" fill-opacity="0.30" stroke="#2563eb" stroke-width="2.5"/>
+    <rect x="822" y="85" width="77" height="70" fill="#ef4444" fill-opacity="0.16" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="6 4"/>
+
+    <text x="860" y="180" text-anchor="middle" font-size="15" font-weight="700" fill="#2563eb">tile 1: k0=16</text>
+    <text x="860" y="200" text-anchor="middle" font-size="13" fill="#2563eb">columns 16..17 real</text>
+    <text x="860" y="225" text-anchor="middle" font-size="15" font-weight="700" fill="#dc2626">columns 18..31 don't exist</text>
+    <text x="860" y="245" text-anchor="middle" font-size="13" fill="#dc2626">a_col ≥ K here</text>
+
+    <path d="M860 255V270" stroke="#dc2626" stroke-width="2.5" marker-end="url(#overhang-arrow)"/>
+    <text x="860" y="290" text-anchor="middle" font-size="14" font-weight="700" fill="#dc2626">must be skipped and padded with 0</text>
+
+    <text x="500" y="330" text-anchor="middle" font-size="15" font-weight="700">green = safe · red = out-of-bounds unless checked</text>
+  </g>
+</svg>
+</figure>
+
+Every thread in the block still runs the same loading code, including the threads whose `a_col`/`b_row` land in the red zone. Without a check, those threads read past the end of `A` or `B` — undefined behavior. The fix is the ternary padding already in the kernel:
+
+```cpp
+int a_col = k0 + threadIdx.x;   // may be >= K in the final K slice
+int b_row = k0 + threadIdx.y;   // may be >= K in the final K slice
+
+As[threadIdx.y][threadIdx.x] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+Bs[threadIdx.y][threadIdx.x] = (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
+```
+
+Zero is a safe placeholder because it contributes nothing to `acc += As[...] * Bs[...]`.
+
+One more consequence: an out-of-range output thread (`row >= M` or `col >= N`) still can't `return` early, because it must reach every `__syncthreads()` alongside its block. It participates in loading (writing zeros) and synchronizing, and only the final store is guarded:
+
+```cpp
+if (row < M && col < N) {
+    C[row * N + col] = acc;
+}
+```
+
+| | Naive | Tiled |
+|---|---|---|
+| What can go out of bounds | Nothing — `k` is loop-bounded | The last K-tile, and edge output blocks |
+| Where the check lives | Once, before the loop (early `return`) | Inside every load, every K-slice iteration |
+| What an out-of-range thread does | Returns immediately | Keeps loading zeros and hitting barriers; only the final store is skipped |
+
+<div style="margin-top:1.75rem"></div>
+
+## Naive versus tiled: final comparison
+
+| Question | Naive | Tiled |
+|---|---|---|
+| Who owns `C[row,col]`? | One thread | The same one thread |
+| How is K traversed? | Sequential scalar `k` loop | Sequential `k0` slices, then local `kk` |
+| Are output threads still parallel? | Yes | Yes |
+| Where does the inner loop read? | Global A/B addresses | Block-private `As`/`Bs` shared-memory tiles |
+| Does tiling reduce arithmetic? | No | No |
+| What does it reduce? | Nothing explicitly | Duplicate input loads within a block |
+| Can blocks share `As` or `Bs`? | Not applicable | No; each block owns separate shared memory |
+| Edge handling | Early output bounds check | Checked, zero-padded shared-memory loads plus guarded final store |
+
+<div style="margin-top:1.75rem"></div>
+
+## Review card
+
+1. One thread owns one C element in both kernels.
+2. Tiling does not reduce thread-level parallelism or the number of multiply-adds.
+3. One thread traverses K slices sequentially; many output threads do this in parallel.
+4. During loading, every thread copies one A value and one B value from global source regions into the block's shared-memory tiles.
+5. `A[row, k0+tx] → As[ty][tx]`.
+6. `B[k0+ty, col] → Bs[ty][tx]`.
+7. During computation, the thread walks `As[ty][kk]` and `Bs[kk][tx]`.
+8. Reuse occurs within a block; other blocks have separate shared memory.
+9. A final partial K slice requires checked loads and zero padding in `As` and `Bs`.
+10. Threads must not return before a `__syncthreads()` that their block peers will reach.
+
+The complete mental model is:
+
+```text
+fixed output ownership
+        +
+sequential traversal of K slices
+        +
+cooperative load → synchronize → shared-memory reuse
+```
