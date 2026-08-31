@@ -592,71 +592,108 @@ A[0,3] → As[0][1]
 B[2,3] → Bs[0][1]
 ```
 
+The local coordinate `(ty,tx)` does not replace the global coordinates. It connects the current thread to one position inside each block-owned shared-memory tile.
+
+That was one thread in one block. The next question is what changes if a *different* block runs this exact same code. The `k0` in `a_col`/`b_row` isn't a per-thread value — it's the outer loop variable, shared by every block:
+
+```cpp
+for (int k0 = 0; k0 < K; k0 += BLOCK) {   // every block runs this loop independently
+    int a_col = k0 + tx;                  // same k0, same tx → same a_col in every block
+    int b_row = k0 + ty;                  // same k0, same ty → same b_row in every block
+    As[ty][tx] = A[row * K + a_col];      // row is this block's own row — that's what varies
+    Bs[ty][tx] = B[b_row * N + col];      // col is this block's own col — that's what varies
+    ...
+}
+```
+
+A few facts fall out of that:
+
+- `a_col` and `b_row` depend only on `k0`, `tx`, `ty` — never on `row`, `col`, or `blockIdx`. At a given loop iteration, every block computes the *same* `a_col` and the *same* `b_row`.
+- `blockIdx` only enters through `row` and `col`, which were fixed once at the top of the kernel (`row` from `blockIdx.y`, `col` from `blockIdx.x`).
+- `A[row, a_col]` combines this block's own `row` with the shared `a_col`. `B[b_row, col]` combines the shared `b_row` with this block's own `col`.
+- The destination slot `As[ty][tx]` / `Bs[ty][tx]` also depends only on `ty`/`tx`, so it's the same slot in every block — but each block writes it into its *own* private tile, not a shared one.
+
+Two concrete blocks make this checkable. Both sit in block-row `y=0`, so both have `row=0`; block `(x=0,y=0)` and block `(x=1,y=0)` sit in different block-columns, so `col` is `1` and `3` respectively:
+
+| | Block (0,0) | Block (1,0) | Same or different? |
+|---|---|---|---|
+| `row` | 0 | 0 | same (same block-row) |
+| `col` | 1 | 3 | different (different block-column) |
+| `a_col = k0+tx` | 3 | 3 | same — no `blockIdx` term |
+| `b_row = k0+ty` | 2 | 2 | same — no `blockIdx` term |
+| `A[row, a_col]` read | `A[0,3]` | `A[0,3]` | **same value, redundantly fetched** |
+| `B[b_row, col]` read | `B[2,1]` | `B[2,3]` | different — `col` differs |
+| Destination slot | `As[0][1]` / `Bs[0][1]` | `As[0][1]` / `Bs[0][1]` | same slot, but each in its own tile |
+
 <figure style="margin:1.75rem 0;overflow-x:auto">
-<svg viewBox="0 0 920 610" role="img" aria-labelledby="mapping-title mapping-desc" style="width:100%;min-width:680px;height:auto">
-  <title id="mapping-title">One thread loads one A value and one B value into matching shared-memory slots</title>
-  <desc id="mapping-desc">With block size two, k0 equal two, and this thread at local row zero column one, the A source formula gives A row zero column three, and the B source formula gives B row two column three. Both values are written into the same local slot row zero column one, one inside the As tile and one inside the Bs tile.</desc>
-  <defs>
-    <marker id="mapping-blue-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2563eb"/></marker>
-    <marker id="mapping-orange-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#d97706"/></marker>
-  </defs>
+<svg viewBox="0 0 1000 470" role="img" aria-labelledby="multiblock-title multiblock-desc" style="width:100%;min-width:720px;height:auto">
+  <title id="multiblock-title">The same k0 loop iteration, run independently by two blocks</title>
+  <desc id="multiblock-desc">Both blocks are at the same outer loop iteration k0 equal two, running the thread at local row zero column one. Block x zero y zero has row zero and col one, so it reads A row zero column three and B row two column one, writing both into its own As zero one and Bs zero one slots. Block x one y zero has row zero and col three, so it reads A row zero column three, the same A value as the other block, and B row two column three, a different B value, writing both into its own As zero one and Bs zero one slots. The two blocks never share a tile; each derivation happens entirely inside that block using only that block's own row and col plus the loop's shared k0.</desc>
   <g font-family="system-ui, sans-serif" fill="currentColor">
-    <text x="620" y="30" text-anchor="middle" font-size="23" font-weight="700">As / Bs shared tile (2 × 2)</text>
+    <text x="500" y="26" text-anchor="middle" font-size="20" font-weight="700">for (k0 = 0; k0 &lt; K; k0 += BLOCK) — both blocks at k0=2, thread (ty=0, tx=1)</text>
 
-    <rect x="20" y="60" width="340" height="118" rx="13" fill="#f59e0b" fill-opacity="0.13" stroke="#d97706" stroke-width="2.5"/>
-    <text x="190" y="88" text-anchor="middle" font-size="17" font-weight="700">A source (k0=2)</text>
-    <text x="190" y="114" text-anchor="middle" font-size="14">a_col = k0 + tx = 2+1 = 3</text>
-    <text x="190" y="134" text-anchor="middle" font-size="14">A[row, a_col] = A[0,3]</text>
-    <text x="190" y="158" text-anchor="middle" font-size="14" font-style="italic">→ As[ty][tx] = As[0][1]</text>
+    <rect x="30" y="55" width="440" height="385" rx="16" fill="#8b5cf6" fill-opacity="0.05" stroke="#7c3aed" stroke-width="2.5"/>
+    <text x="250" y="83" text-anchor="middle" font-size="17" font-weight="700">Block (x=0, y=0)</text>
+    <text x="250" y="105" text-anchor="middle" font-size="13">this block's row=0, col=1</text>
 
-    <rect x="20" y="254" width="340" height="118" rx="13" fill="#3b82f6" fill-opacity="0.12" stroke="#2563eb" stroke-width="2.5"/>
-    <text x="190" y="282" text-anchor="middle" font-size="17" font-weight="700">B source (k0=2)</text>
-    <text x="190" y="308" text-anchor="middle" font-size="14">b_row = k0 + ty = 2+0 = 2</text>
-    <text x="190" y="328" text-anchor="middle" font-size="14">B[b_row, col] = B[2,3]</text>
-    <text x="190" y="352" text-anchor="middle" font-size="14" font-style="italic">→ Bs[ty][tx] = Bs[0][1]</text>
+    <rect x="55" y="122" width="390" height="92" rx="8" fill="#10b981" fill-opacity="0.09" stroke="#059669" stroke-width="1.5"/>
+    <text x="250" y="144" text-anchor="middle" font-size="12.5" font-family="monospace">a_col = k0+tx = 2+1 = 3</text>
+    <text x="250" y="163" text-anchor="middle" font-size="12.5" font-family="monospace">b_row = k0+ty = 2+0 = 2</text>
+    <text x="250" y="184" text-anchor="middle" font-size="12.5" font-family="monospace" font-weight="700">A[row,a_col] = A[0,3]</text>
+    <text x="250" y="203" text-anchor="middle" font-size="12.5" font-family="monospace" font-weight="700">B[b_row,col] = B[2,1]</text>
 
-    <path d="M365 138C455 138 530 145 618 155" fill="none" stroke="#d97706" stroke-width="3" marker-end="url(#mapping-orange-arrow)"/>
-    <path d="M365 320C470 320 545 315 618 305" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#mapping-blue-arrow)"/>
+    <path d="M250 214V236" stroke="currentColor" stroke-opacity="0.5" stroke-width="2"/>
 
-    <text x="900" y="95" text-anchor="middle" font-size="17" font-weight="700" fill="#d97706">As</text>
-    <text x="900" y="285" text-anchor="middle" font-size="17" font-weight="700" fill="#2563eb">Bs</text>
+    <rect x="100" y="240" width="140" height="95" rx="6" fill="none" stroke="#d97706" stroke-width="2"/>
+    <path d="M170 240V335M100 287H240" stroke="currentColor" stroke-opacity="0.35" stroke-width="1"/>
+    <rect x="170" y="240" width="70" height="47" fill="#f59e0b" fill-opacity="0.35" stroke="#d97706" stroke-width="3"/>
+    <text x="205" y="268" text-anchor="middle" font-size="12" font-weight="700">A[0,3]</text>
+    <text x="205" y="352" text-anchor="middle" font-size="12" font-weight="700" fill="#d97706">As[0][1]</text>
 
-    <rect x="480" y="80" width="280" height="140" rx="10" fill="none" stroke="#d97706" stroke-width="3"/>
-    <g stroke="currentColor" stroke-opacity="0.45" stroke-width="1.5">
-      <path d="M620 80V220"/>
-      <path d="M480 150H760"/>
-    </g>
-    <text x="550" y="70" text-anchor="middle" font-size="14">tx 0</text>
-    <text x="690" y="70" text-anchor="middle" font-size="14">tx 1</text>
-    <text x="465" y="120" text-anchor="middle" font-size="14">ty 0</text>
-    <text x="465" y="190" text-anchor="middle" font-size="14">ty 1</text>
-    <rect x="620" y="80" width="140" height="70" fill="#f59e0b" fill-opacity="0.30" stroke="#d97706" stroke-width="4"/>
-    <text x="690" y="121" text-anchor="middle" font-size="15" font-weight="700">As[0][1]=A[0,3]</text>
+    <rect x="260" y="240" width="140" height="95" rx="6" fill="none" stroke="#2563eb" stroke-width="2"/>
+    <path d="M330 240V335M260 287H400" stroke="currentColor" stroke-opacity="0.35" stroke-width="1"/>
+    <rect x="330" y="240" width="70" height="47" fill="#3b82f6" fill-opacity="0.32" stroke="#2563eb" stroke-width="3"/>
+    <text x="365" y="268" text-anchor="middle" font-size="12" font-weight="700">B[2,1]</text>
+    <text x="365" y="352" text-anchor="middle" font-size="12" font-weight="700" fill="#2563eb">Bs[0][1]</text>
 
-    <rect x="480" y="270" width="280" height="140" rx="10" fill="none" stroke="#2563eb" stroke-width="3"/>
-    <g stroke="currentColor" stroke-opacity="0.45" stroke-width="1.5">
-      <path d="M620 270V410"/>
-      <path d="M480 340H760"/>
-    </g>
-    <text x="550" y="260" text-anchor="middle" font-size="14">tx 0</text>
-    <text x="690" y="260" text-anchor="middle" font-size="14">tx 1</text>
-    <text x="465" y="310" text-anchor="middle" font-size="14">ty 0</text>
-    <text x="465" y="380" text-anchor="middle" font-size="14">ty 1</text>
-    <rect x="620" y="270" width="140" height="70" fill="#3b82f6" fill-opacity="0.30" stroke="#2563eb" stroke-width="4"/>
-    <text x="690" y="311" text-anchor="middle" font-size="15" font-weight="700">Bs[0][1]=B[2,3]</text>
+    <text x="250" y="385" text-anchor="middle" font-size="12" fill-opacity="0.7">own As/Bs (2×2), private to this block</text>
+    <text x="250" y="410" text-anchor="middle" font-size="13" font-weight="700" fill="#059669">reads A[0,3] and B[2,1] — both derived locally</text>
 
-    <text x="620" y="450" text-anchor="middle" font-size="15" font-weight="700">same slot [ty][tx] = [0][1] in both tiles</text>
+    <rect x="530" y="55" width="440" height="385" rx="16" fill="#8b5cf6" fill-opacity="0.05" stroke="#7c3aed" stroke-width="2.5"/>
+    <text x="750" y="83" text-anchor="middle" font-size="17" font-weight="700">Block (x=1, y=0)</text>
+    <text x="750" y="105" text-anchor="middle" font-size="13">this block's row=0, col=3</text>
 
-    <rect x="60" y="480" width="800" height="112" rx="13" fill="#10b981" fill-opacity="0.11" stroke="#059669" stroke-width="2.5"/>
-    <text x="460" y="507" text-anchor="middle" font-size="15" font-weight="700">As[ty][tx] = A[row, k0+tx] = A[0, 2+1] = A[0,3]</text>
-    <text x="460" y="531" text-anchor="middle" font-size="15" font-weight="700">Bs[ty][tx] = B[k0+ty, col] = B[2+0, 3] = B[2,3]</text>
-    <text x="460" y="558" text-anchor="middle" font-size="14">Global source coordinates differ (A[0,3] vs B[2,3]);</text>
-    <text x="460" y="578" text-anchor="middle" font-size="14" font-weight="700">the local destination slot is the same: [ty][tx] = [0][1].</text>
+    <rect x="555" y="122" width="390" height="92" rx="8" fill="#10b981" fill-opacity="0.09" stroke="#059669" stroke-width="1.5"/>
+    <text x="750" y="144" text-anchor="middle" font-size="12.5" font-family="monospace">a_col = k0+tx = 2+1 = 3</text>
+    <text x="750" y="163" text-anchor="middle" font-size="12.5" font-family="monospace">b_row = k0+ty = 2+0 = 2</text>
+    <text x="750" y="184" text-anchor="middle" font-size="12.5" font-family="monospace" font-weight="700">A[row,a_col] = A[0,3]</text>
+    <text x="750" y="203" text-anchor="middle" font-size="12.5" font-family="monospace" font-weight="700">B[b_row,col] = B[2,3]</text>
+
+    <path d="M750 214V236" stroke="currentColor" stroke-opacity="0.5" stroke-width="2"/>
+
+    <rect x="600" y="240" width="140" height="95" rx="6" fill="none" stroke="#d97706" stroke-width="2"/>
+    <path d="M670 240V335M600 287H740" stroke="currentColor" stroke-opacity="0.35" stroke-width="1"/>
+    <rect x="670" y="240" width="70" height="47" fill="#f59e0b" fill-opacity="0.35" stroke="#d97706" stroke-width="3"/>
+    <text x="705" y="268" text-anchor="middle" font-size="12" font-weight="700">A[0,3]</text>
+    <text x="705" y="352" text-anchor="middle" font-size="12" font-weight="700" fill="#d97706">As[0][1]</text>
+
+    <rect x="760" y="240" width="140" height="95" rx="6" fill="none" stroke="#2563eb" stroke-width="2"/>
+    <path d="M830 240V335M760 287H900" stroke="currentColor" stroke-opacity="0.35" stroke-width="1"/>
+    <rect x="830" y="240" width="70" height="47" fill="#3b82f6" fill-opacity="0.32" stroke="#2563eb" stroke-width="3"/>
+    <text x="865" y="268" text-anchor="middle" font-size="12" font-weight="700">B[2,3]</text>
+    <text x="865" y="352" text-anchor="middle" font-size="12" font-weight="700" fill="#2563eb">Bs[0][1]</text>
+
+    <text x="750" y="385" text-anchor="middle" font-size="12" fill-opacity="0.7">own As/Bs (2×2), private to this block</text>
+    <text x="750" y="410" text-anchor="middle" font-size="13" font-weight="700" fill="#059669">reads A[0,3] and B[2,3] — both derived locally</text>
+
+    <text x="500" y="452" text-anchor="middle" font-size="13" fill-opacity="0.8">Each block derives a_col/b_row independently, from the same k0 — nothing is passed between blocks.</text>
   </g>
 </svg>
 </figure>
 
-The local coordinate `(ty,tx)` does not replace the global coordinates. It connects the current thread to one position inside each block-owned shared-memory tile.
+Both derivations start from the same loop iteration and the same formula, but each block runs it with its own `row`/`col` — there is no arrow crossing between the two panels because nothing does. Block `(1,0)` doesn't receive `A[0,3]` from block `(0,0)`; it *re-derives* it from its own `row=0` combined with the shared `a_col=3`, and just happens to land on the same value because both blocks are in block-row `y=0`.
+
+The pattern generalizes: at any loop iteration, every block computes the same `a_col`/`b_row`, but each combines them with its own `row`/`col`. Depending on the grid layout, that can land on the same global value (as with A here) or a different one (as with B here). Either way, the destination is always the same local slot, just inside that block's own private tile.
 
 This thread only ever writes **one** `As` entry and **one** `Bs` entry. With `BLOCK=2`, the whole block has four threads, and together they fill all four entries of each tile — no thread fills more than its own slot:
 
